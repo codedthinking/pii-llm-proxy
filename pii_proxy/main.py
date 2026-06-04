@@ -92,12 +92,9 @@ async def chat_completions(request: Request):
     except Exception as e:
         return Response(content=str(e), status_code=422)
 
+    # Force non-streaming — proxy needs full response to dehash
     if body.stream:
-        return Response(
-            content='{"error": "Streaming is not supported in v1"}',
-            status_code=501,
-            media_type="application/json",
-        )
+        body = body.model_copy(update={"stream": False})
 
     headers_dict = {k.lower(): v for k, v in request.headers.items()}
     conversation_id, is_new = _resolve_conversation_id(headers_dict, body)

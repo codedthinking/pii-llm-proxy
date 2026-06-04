@@ -49,13 +49,26 @@ def test_single_turn_sanitize_and_dehash():
                 assert "john@example.com" not in msg["content"]
 
 
-def test_stream_returns_501():
-    response = client.post(
-        "/v1/chat/completions",
-        json={
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "hello"}],
-            "stream": True,
-        },
-    )
-    assert response.status_code == 501
+def test_stream_forced_to_false():
+    """stream=true should be overridden to false and forwarded normally."""
+    resp_body = {
+        "id": "chatcmpl-test",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+    }
+    with respx.mock:
+        route = respx.post(_upstream_url("chat/completions")).mock(
+            return_value=httpx.Response(200, json=resp_body)
+        )
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+        assert response.status_code == 200
+        # Verify stream was forced to false in the forwarded request
+        sent_body = json.loads(route.calls[0].request.content)
+        assert sent_body["stream"] is False
