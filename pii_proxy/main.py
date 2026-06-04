@@ -4,8 +4,6 @@ import uuid
 
 import httpx
 from fastapi import FastAPI, Request, Response
-from presidio_analyzer import AnalyzerEngine
-
 from .config import settings
 from .desanitizer import desanitize_text
 from .models import ChatCompletionRequest, ContentPart
@@ -17,7 +15,6 @@ logging.basicConfig(level=logging.DEBUG)
 
 app = FastAPI(title="PII Sanitizing LLM Proxy")
 store = SessionStore()
-analyzer = AnalyzerEngine()
 
 
 def _get_auth_header(headers_dict: dict[str, str]) -> str | None:
@@ -40,16 +37,15 @@ def _resolve_conversation_id(request_headers: dict[str, str], body: ChatCompleti
     return str(uuid.uuid4()), True
 
 
-def _sanitize_message_content(content: str | list[ContentPart] | None, session, ana) -> str | list[ContentPart] | None:
+def _sanitize_message_content(content: str | list[ContentPart] | None, session) -> str | list[ContentPart] | None:
     if content is None:
         return None
     if isinstance(content, str):
-        return sanitize_text(content, session, ana)
-    # list of content parts
+        return sanitize_text(content, session)
     sanitized_parts = []
     for part in content:
         if part.type == "text" and part.text is not None:
-            new_part = part.model_copy(update={"text": sanitize_text(part.text, session, ana)})
+            new_part = part.model_copy(update={"text": sanitize_text(part.text, session)})
             sanitized_parts.append(new_part)
         else:
             sanitized_parts.append(part)
@@ -59,7 +55,7 @@ def _sanitize_message_content(content: str | list[ContentPart] | None, session, 
 def _sanitize_request(body: ChatCompletionRequest, session) -> ChatCompletionRequest:
     sanitized_messages = []
     for msg in body.messages:
-        new_content = _sanitize_message_content(msg.content, session, analyzer)
+        new_content = _sanitize_message_content(msg.content, session)
         sanitized_messages.append(msg.model_copy(update={"content": new_content}))
 
     # Inject system notice
@@ -206,10 +202,10 @@ async def embeddings(request: Request):
     if "input" in raw_body:
         inp = raw_body["input"]
         if isinstance(inp, str):
-            raw_body["input"] = sanitize_text(inp, session, analyzer)
+            raw_body["input"] = sanitize_text(inp, session)
         elif isinstance(inp, list):
             raw_body["input"] = [
-                sanitize_text(item, session, analyzer) if isinstance(item, str) else item
+                sanitize_text(item, session) if isinstance(item, str) else item
                 for item in inp
             ]
 

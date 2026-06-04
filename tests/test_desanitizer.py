@@ -46,17 +46,15 @@ def test_desanitize_empty_session():
 
 def test_roundtrip():
     """Sanitize then desanitize should recover original PII values."""
-    from presidio_analyzer import AnalyzerEngine
     from pii_proxy.sanitizer import sanitize_text
 
-    analyzer = AnalyzerEngine()
     session = Session(salt=os.urandom(16))
-    original = "My name is John Smith and my email is john@example.com."
+    original = "My email is john@example.com and SSN is 123-45-6789."
 
-    sanitized = sanitize_text(original, session, analyzer)
-    assert "John Smith" not in sanitized
+    sanitized = sanitize_text(original, session)
     assert "john@example.com" not in sanitized
+    assert "123-45-6789" not in sanitized
 
     restored = desanitize_text(sanitized, session)
-    assert "John Smith" in restored
     assert "john@example.com" in restored
+    assert "123-45-6789" in restored

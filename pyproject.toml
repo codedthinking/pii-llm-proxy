@@ -6,6 +6,7 @@ requires-python = ">=3.13"
 dependencies = [
     "anyio>=4.13.0",
     "cachetools>=7.1.4",
+    "faker>=40.21.0",
     "fastapi>=0.136.3",
     "httpx>=0.28.1",
     "presidio-analyzer>=2.2.362",
