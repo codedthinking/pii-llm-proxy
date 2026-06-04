@@ -11,8 +11,8 @@ from .config import settings
 @dataclass
 class Session:
     salt: bytes
-    hash_to_pii: dict[str, str] = field(default_factory=dict)
-    pii_to_hash: dict[str, str] = field(default_factory=dict)
+    real_to_fake: dict[str, str] = field(default_factory=dict)
+    fake_to_real: dict[str, str] = field(default_factory=dict)
     system_notice_injected: bool = False
     created_at: datetime = field(default_factory=datetime.now)
 

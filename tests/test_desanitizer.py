@@ -4,48 +4,50 @@ from pii_proxy.desanitizer import desanitize_text
 from pii_proxy.session import Session
 
 
-def _make_session_with_mapping(pii: str, hash_val: str) -> Session:
+def _make_session_with_mapping(real: str, fake: str) -> Session:
     session = Session(salt=os.urandom(16))
-    session.hash_to_pii[hash_val] = pii
-    session.pii_to_hash[pii] = hash_val
+    session.fake_to_real[fake] = real
+    session.real_to_fake[real] = fake
     return session
 
 
-def test_desanitize_full_tag():
-    session = _make_session_with_mapping("John Smith", "abc123def456")
-    text = 'Please contact <redacted hash="abc123def456" type="PERSON"/>.'
+def test_desanitize_fake_name():
+    session = _make_session_with_mapping("Miklos Koren", "John Doe")
+    text = "Please contact John Doe."
     result = desanitize_text(text, session)
-    assert result == "Please contact John Smith."
+    assert result == "Please contact Miklos Koren."
 
 
-def test_desanitize_bare_hash():
-    session = _make_session_with_mapping("John Smith", "abc123def456")
-    text = "The person abc123def456 said hello."
-    result = desanitize_text(text, session)
-    assert result == "The person John Smith said hello."
-
-
-def test_desanitize_multiple_hashes():
+def test_desanitize_multiple_fakes():
     session = Session(salt=os.urandom(16))
-    session.hash_to_pii["aaa111bbb222"] = "Alice"
-    session.hash_to_pii["ccc333ddd444"] = "Bob"
-    session.pii_to_hash["Alice"] = "aaa111bbb222"
-    session.pii_to_hash["Bob"] = "ccc333ddd444"
+    session.fake_to_real["Alice Smith"] = "Miklos Koren"
+    session.fake_to_real["bob@fake.com"] = "real@example.com"
+    session.real_to_fake["Miklos Koren"] = "Alice Smith"
+    session.real_to_fake["real@example.com"] = "bob@fake.com"
 
-    text = '<redacted hash="aaa111bbb222" type="PERSON"/> called <redacted hash="ccc333ddd444" type="PERSON"/>.'
+    text = "Alice Smith emailed bob@fake.com."
     result = desanitize_text(text, session)
-    assert result == "Alice called Bob."
+    assert result == "Miklos Koren emailed real@example.com."
 
 
 def test_desanitize_empty_session():
     session = Session(salt=os.urandom(16))
-    text = "No hashes here."
+    text = "No fakes here."
     result = desanitize_text(text, session)
     assert result == text
 
 
+def test_longest_match_first():
+    """Ensure 'John Doe' is replaced before 'John'."""
+    session = Session(salt=os.urandom(16))
+    session.fake_to_real["John Doe"] = "Real Person"
+    session.fake_to_real["John"] = "Another"
+    text = "Hello John Doe."
+    result = desanitize_text(text, session)
+    assert result == "Hello Real Person."
+
+
 def test_roundtrip():
-    """Sanitize then desanitize should recover original PII values."""
     from pii_proxy.sanitizer import sanitize_text
 
     session = Session(salt=os.urandom(16))
