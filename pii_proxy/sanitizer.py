@@ -6,10 +6,8 @@ from .config import settings
 from .session import Session
 
 SYSTEM_NOTICE = (
-    "Some values in this conversation have been redacted for privacy and replaced "
-    'with XML tags of the form <redacted hash="..." type="..."/>. '
-    "Each unique hash refers to a distinct redacted value. Do not invent or guess "
-    "the original values. Treat hashes as opaque identifiers."
+    'Redacted values appear as <redacted hash="..." type="..."/>. '
+    "Same hash = same entity. Do not guess original values."
 )
 
 

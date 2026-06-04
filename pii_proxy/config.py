@@ -19,6 +19,7 @@ class Settings(BaseSettings):
         "MEDICAL_LICENSE",
     ]
     inject_system_notice: bool = True
+    openrouter_api_key: str | None = None
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

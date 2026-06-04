@@ -1,3 +1,4 @@
+import json
 import logging
 import uuid
 
@@ -7,7 +8,7 @@ from presidio_analyzer import AnalyzerEngine
 
 from .config import settings
 from .desanitizer import desanitize_text
-from .models import ChatCompletionRequest, ChatCompletionResponse, ContentPart
+from .models import ChatCompletionRequest, ContentPart
 from .sanitizer import SYSTEM_NOTICE, sanitize_text
 from .session import SessionStore
 
@@ -17,6 +18,15 @@ logging.basicConfig(level=logging.DEBUG)
 app = FastAPI(title="PII Sanitizing LLM Proxy")
 store = SessionStore()
 analyzer = AnalyzerEngine()
+
+
+def _get_auth_header(headers_dict: dict[str, str]) -> str | None:
+    """Return auth header from client request, falling back to configured API key."""
+    if "authorization" in headers_dict:
+        return headers_dict["authorization"]
+    if settings.openrouter_api_key:
+        return f"Bearer {settings.openrouter_api_key}"
+    return None
 
 
 def _resolve_conversation_id(request_headers: dict[str, str], body: ChatCompletionRequest) -> tuple[str, bool]:
@@ -49,11 +59,8 @@ def _sanitize_message_content(content: str | list[ContentPart] | None, session, 
 def _sanitize_request(body: ChatCompletionRequest, session) -> ChatCompletionRequest:
     sanitized_messages = []
     for msg in body.messages:
-        if msg.role in ("user", "system", "tool"):
-            new_content = _sanitize_message_content(msg.content, session, analyzer)
-            sanitized_messages.append(msg.model_copy(update={"content": new_content}))
-        else:
-            sanitized_messages.append(msg)
+        new_content = _sanitize_message_content(msg.content, session, analyzer)
+        sanitized_messages.append(msg.model_copy(update={"content": new_content}))
 
     # Inject system notice
     if settings.inject_system_notice and not session.system_notice_injected:
@@ -73,16 +80,6 @@ def _sanitize_request(body: ChatCompletionRequest, session) -> ChatCompletionReq
     return body.model_copy(update={"messages": sanitized_messages})
 
 
-def _desanitize_response(resp: ChatCompletionResponse, session) -> ChatCompletionResponse:
-    for choice in resp.choices:
-        msg = choice.message
-        if msg.content:
-            msg.content = desanitize_text(msg.content, session)
-        if msg.tool_calls:
-            for tc in msg.tool_calls:
-                tc.function.arguments = desanitize_text(tc.function.arguments, session)
-    return resp
-
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
@@ -92,8 +89,10 @@ async def chat_completions(request: Request):
     except Exception as e:
         return Response(content=str(e), status_code=422)
 
-    # Force non-streaming — proxy needs full response to dehash
-    if body.stream:
+    # Remember if client wanted streaming — we force non-streaming upstream
+    # so we can dehash the full response, then re-wrap as SSE if needed.
+    client_wants_stream = body.stream
+    if client_wants_stream:
         body = body.model_copy(update={"stream": False})
 
     headers_dict = {k.lower(): v for k, v in request.headers.items()}
@@ -114,10 +113,10 @@ async def chat_completions(request: Request):
     logger.debug("Sanitized request: %s", sanitized_dict)
 
     # Forward to remote LLM
-    forward_headers = {}
-    if "authorization" in headers_dict:
-        forward_headers["Authorization"] = headers_dict["authorization"]
-    forward_headers["Content-Type"] = "application/json"
+    forward_headers = {"Content-Type": "application/json"}
+    auth = _get_auth_header(headers_dict)
+    if auth:
+        forward_headers["Authorization"] = auth
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         try:
@@ -135,24 +134,61 @@ async def chat_completions(request: Request):
             )
 
     if upstream_resp.status_code != 200:
+        logger.error("Upstream returned %d: %s", upstream_resp.status_code, upstream_resp.text)
         return Response(
             content=upstream_resp.content,
             status_code=upstream_resp.status_code,
             media_type="application/json",
         )
 
-    try:
-        resp_data = upstream_resp.json()
-        completion = ChatCompletionResponse.model_validate(resp_data)
-        completion = _desanitize_response(completion, session)
-        resp_dict = completion.model_dump(exclude_none=True)
-    except Exception:
-        logger.exception("Failed to parse/dehash upstream response")
-        resp_dict = upstream_resp.json()
+    # Desanitize the entire response text at once to catch all fields
+    raw_text = upstream_resp.text
+    logger.debug("Upstream response: %s", raw_text[:500])
+    desanitized_text = desanitize_text(raw_text, session)
+    logger.debug("Desanitized response: %s", desanitized_text[:500])
 
     response_headers = {"X-Conversation-ID": conversation_id}
+
+    if client_wants_stream:
+        # Convert chat.completion to chat.completion.chunk format
+        resp_data = json.loads(desanitized_text)
+        chunk = {
+            "id": resp_data.get("id", ""),
+            "object": "chat.completion.chunk",
+            "created": resp_data.get("created", 0),
+            "model": resp_data.get("model", ""),
+        }
+        # Copy provider-specific fields
+        for key in ("provider", "system_fingerprint", "service_tier"):
+            if key in resp_data:
+                chunk[key] = resp_data[key]
+        # Convert choices: message -> delta, include all extra fields
+        chunk["choices"] = []
+        for choice in resp_data.get("choices", []):
+            msg = choice.get("message", {})
+            chunk_choice = {
+                "index": choice.get("index", 0),
+                "delta": msg,
+                "finish_reason": choice.get("finish_reason"),
+            }
+            # Copy extra choice fields (logprobs, native_finish_reason, etc.)
+            for key in choice:
+                if key not in ("index", "message", "finish_reason"):
+                    chunk_choice[key] = choice[key]
+            chunk["choices"].append(chunk_choice)
+        if "usage" in resp_data:
+            chunk["usage"] = resp_data["usage"]
+        chunk_json = json.dumps(chunk, ensure_ascii=False)
+        sse_body = f"data: {chunk_json}\n\ndata: [DONE]\n\n"
+        return Response(
+            content=sse_body,
+            status_code=200,
+            media_type="text/event-stream",
+            headers=response_headers,
+        )
+
     return Response(
-        content=ChatCompletionResponse.model_validate(resp_dict).model_dump_json(),
+        content=desanitized_text,
         status_code=200,
         media_type="application/json",
         headers=response_headers,
@@ -178,8 +214,9 @@ async def embeddings(request: Request):
             ]
 
     forward_headers = {"Content-Type": "application/json"}
-    if "authorization" in headers_dict:
-        forward_headers["Authorization"] = headers_dict["authorization"]
+    auth = _get_auth_header(headers_dict)
+    if auth:
+        forward_headers["Authorization"] = auth
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         try:
@@ -198,8 +235,9 @@ async def embeddings(request: Request):
 async def passthrough(request: Request, path: str):
     headers_dict = {k.lower(): v for k, v in request.headers.items()}
     forward_headers = {"Content-Type": headers_dict.get("content-type", "application/json")}
-    if "authorization" in headers_dict:
-        forward_headers["Authorization"] = headers_dict["authorization"]
+    auth = _get_auth_header(headers_dict)
+    if auth:
+        forward_headers["Authorization"] = auth
 
     body = await request.body()
     url = f"{settings.remote_llm_base_url}/{path}"
