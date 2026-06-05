@@ -53,7 +53,7 @@ The proxy passes the client's `Authorization` header through to the upstream pro
 
 ## Using with OpenCode
 
-Add the proxy as a custom OpenAI-compatible provider in `opencode.json`:
+Copy [`opencode.example.json`](opencode.example.json) to `opencode.json` in your project and adjust the model list as needed:
 
 ```json
 {
@@ -65,19 +65,29 @@ Add the proxy as a custom OpenAI-compatible provider in `opencode.json`:
         "baseURL": "http://localhost:8001/v1"
       },
       "models": {
-        "anthropic/claude-sonnet-4": {
-          "name": "Claude Sonnet 4 (PII-safe)",
-          "limit": {
-            "context": 200000,
-            "output": 65536
-          }
+        "minimax/minimax-m3": {
+          "name": "Minimax M3 (PII Proxy)"
         },
-        "openai/gpt-4o": {
-          "name": "GPT-4o (PII-safe)",
-          "limit": {
-            "context": 128000,
-            "output": 16384
-          }
+        "xiaomi/mimo-v2.5": {
+          "name": "Xiaomi MiMo v2.5 (PII Proxy)"
+        },
+        "moonshotai/kimi-k2.6": {
+          "name": "Kimi K2.6 (PII Proxy)"
+        },
+        "google/gemma-4-26b-a4b-it:free": {
+          "name": "Gemma 4 26B free (PII Proxy)"
+        },
+        "qwen/qwen3-235b-a22b-2507": {
+          "name": "Qwen3 235B (PII Proxy)"
+        },
+        "deepseek/deepseek-v4-flash": {
+          "name": "DeepSeek V4 Flash (PII Proxy)"
+        },
+        "anthropic/claude-sonnet-latest": {
+          "name": "Claude Sonnet latest (PII Proxy)"
+        },
+        "openai/gpt-5.5": {
+          "name": "GPT-5.5 (PII Proxy)"
         }
       }
     }
@@ -87,9 +97,7 @@ Add the proxy as a custom OpenAI-compatible provider in `opencode.json`:
 
 Then run `/connect` in OpenCode, select "Other", enter `pii-proxy` as the provider ID, and supply your upstream API key (e.g., your OpenRouter key). Or set `UPSTREAM_API_KEY` in the proxy's `.env` and skip client-side auth.
 
-Model names follow whatever naming the upstream provider uses. For OpenRouter, that is `provider/model` (e.g., `anthropic/claude-sonnet-4`). The proxy does not interpret model names — it forwards them as-is.
-
-The `/v1/models` endpoint is proxied through, so OpenCode can discover available models automatically.
+Model IDs follow whatever naming the upstream provider uses. For OpenRouter, that is `provider/model` (e.g., `anthropic/claude-sonnet-latest`). The proxy does not interpret model names — it forwards them as-is. OpenCode does not auto-discover models from custom providers, so you must list them explicitly in `opencode.json`.
 
 ## Using with other AI SDK clients
 
