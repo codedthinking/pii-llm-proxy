@@ -92,23 +92,38 @@ async def _forward_non_streaming(
 
 
 async def _stream_with_desanitization(body: dict, session, headers: dict[str, str]):
-    """Stream SSE chunks from upstream, desanitizing text content on the fly.
+    """Stream SSE chunks from upstream, desanitizing all text on the fly.
 
-    Uses a buffer to handle fake values that may span chunk boundaries.
-    Only emits text that is "settled" — i.e., cannot be part of a partial
-    fake value match. Flushes the remainder on stream end.
+    Buffers both content deltas and tool_call argument deltas to handle
+    fake values that may span chunk boundaries.  Only emits text that is
+    "settled" — i.e., cannot be part of a partial fake value match.
+    Flushes all remaining buffers on stream end.
     """
     anonymizer = get_anonymizer()
 
-    # Accumulated raw content text from all chunks so far
-    raw_buffer = ""
-    # How many characters of desanitized output we have already emitted
-    emitted_len = 0
+    # Content buffer
+    content_buf = ""
+    content_emitted = 0
+
+    # Tool-call argument buffers: keyed by (choice_index, tool_call_index)
+    tc_bufs: dict[tuple[int, int], str] = {}
+    tc_emitted: dict[tuple[int, int], int] = {}
 
     def _max_fake_len() -> int:
         if not session.fake_to_real:
             return 0
         return max(len(f) for f in session.fake_to_real)
+
+    def _settled_desanitize(buf: str, emitted: int, flush: bool) -> tuple[str, int]:
+        """Desanitize buffer, return (delta_to_emit, new_emitted)."""
+        mfl = _max_fake_len()
+        full = anonymizer.desanitize(buf, session)
+        if flush or mfl == 0:
+            safe_end = len(full)
+        else:
+            safe_end = max(0, len(full) - mfl)
+        delta = full[emitted:safe_end]
+        return delta, safe_end
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         async with client.stream(
@@ -118,30 +133,31 @@ async def _stream_with_desanitization(body: dict, session, headers: dict[str, st
             headers=headers,
         ) as resp:
             if resp.status_code != 200:
-                # Non-200: read full body and yield as-is
                 body_bytes = await resp.aread()
                 yield body_bytes
                 return
 
             async for raw_line in resp.aiter_lines():
                 if not raw_line.startswith("data: "):
-                    # Forward non-data lines (empty lines, comments) as-is
                     yield raw_line + "\n"
                     continue
 
                 payload = raw_line[6:]
 
                 if payload.strip() == "[DONE]":
-                    # Flush remaining buffer
-                    if raw_buffer:
-                        desanitized_full = anonymizer.desanitize(raw_buffer, session)
-                        remaining = desanitized_full[emitted_len:]
-                        if remaining:
-                            # We need to emit a final content chunk with the remaining text.
-                            # Reconstruct using the last seen chunk as template.
-                            flush_chunk = {
-                                "choices": [{"index": 0, "delta": {"content": remaining}}],
-                            }
+                    # Flush content buffer
+                    if content_buf:
+                        delta, _ = _settled_desanitize(content_buf, content_emitted, flush=True)
+                        if delta:
+                            flush_chunk = {"choices": [{"index": 0, "delta": {"content": delta}}]}
+                            yield f"data: {json.dumps(flush_chunk, ensure_ascii=False)}\n\n"
+                    # Flush tool-call argument buffers
+                    for (ci, ti), buf in tc_bufs.items():
+                        delta, _ = _settled_desanitize(buf, tc_emitted.get((ci, ti), 0), flush=True)
+                        if delta:
+                            flush_chunk = {"choices": [{"index": ci, "delta": {
+                                "tool_calls": [{"index": ti, "function": {"arguments": delta}}],
+                            }}]}
                             yield f"data: {json.dumps(flush_chunk, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
@@ -152,51 +168,54 @@ async def _stream_with_desanitization(body: dict, session, headers: dict[str, st
                     yield raw_line + "\n"
                     continue
 
-                # Extract content delta
                 choices = chunk.get("choices", [])
-                has_content = False
-                is_finished = False
-                for choice in choices:
-                    delta = choice.get("delta", {})
-                    content = delta.get("content")
-                    if choice.get("finish_reason"):
-                        is_finished = True
-                    if content is not None:
-                        has_content = True
-                        raw_buffer += content
+                is_finished = any(c.get("finish_reason") for c in choices)
+                has_text = False  # did we handle any text-bearing field?
 
-                if not has_content:
-                    # Non-content chunk (role, tool_calls, etc.) — forward as-is
+                for choice in choices:
+                    ci = choice.get("index", 0)
+                    delta = choice.get("delta", {})
+
+                    # --- Content ---
+                    content = delta.get("content")
+                    if content is not None:
+                        has_text = True
+                        content_buf += content
+                        emit_delta, content_emitted = _settled_desanitize(
+                            content_buf, content_emitted, flush=is_finished,
+                        )
+                        if emit_delta:
+                            choice["delta"]["content"] = emit_delta
+                        else:
+                            # Hold back — remove content from this chunk
+                            del choice["delta"]["content"]
+
+                    # --- Tool-call arguments ---
+                    tool_calls = delta.get("tool_calls")
+                    if tool_calls:
+                        for tc in tool_calls:
+                            ti = tc.get("index", 0)
+                            args = tc.get("function", {}).get("arguments")
+                            if args is not None:
+                                has_text = True
+                                key = (ci, ti)
+                                tc_bufs[key] = tc_bufs.get(key, "") + args
+                                tc_emitted.setdefault(key, 0)
+                                emit_delta, tc_emitted[key] = _settled_desanitize(
+                                    tc_bufs[key], tc_emitted[key], flush=is_finished,
+                                )
+                                if emit_delta:
+                                    tc["function"]["arguments"] = emit_delta
+                                else:
+                                    tc["function"]["arguments"] = ""
+
+                if not has_text:
+                    # Non-text chunk (role, metadata, etc.) — forward as-is
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                     continue
 
-                # Determine how much we can safely emit
-                mfl = _max_fake_len()
-                desanitized_full = anonymizer.desanitize(raw_buffer, session)
-
-                if is_finished or mfl == 0:
-                    safe_end = len(desanitized_full)
-                else:
-                    safe_end = max(0, len(desanitized_full) - mfl)
-
-                delta_text = desanitized_full[emitted_len:safe_end]
-                emitted_len = safe_end
-
-                if delta_text:
-                    # Replace content in the chunk with desanitized delta
-                    for choice in chunk.get("choices", []):
-                        if "delta" in choice and "content" in choice["delta"]:
-                            choice["delta"]["content"] = delta_text
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                elif is_finished:
-                    # Flush any remaining
-                    remaining = desanitized_full[emitted_len:]
-                    if remaining:
-                        for choice in chunk.get("choices", []):
-                            if "delta" in choice:
-                                choice["delta"]["content"] = remaining
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                # If delta_text is empty and not finished, hold back (buffering)
+                # Emit chunk if it still has meaningful deltas
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
 @app.post("/v1/chat/completions")
