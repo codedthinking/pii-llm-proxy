@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     ]
     inject_system_notice: bool = True
     openrouter_api_key: str | None = None
+    pii_detector_backend: str = "regex"  # "regex" or "presidio"
+    llm_client_backend: str = "httpx"  # "httpx" or "litellm"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

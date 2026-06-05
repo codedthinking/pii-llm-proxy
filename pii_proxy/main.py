@@ -2,12 +2,12 @@ import json
 import logging
 import uuid
 
-import httpx
 from fastapi import FastAPI, Request, Response
+
 from .config import settings
-from .desanitizer import desanitize_text
+from .llm import get_client
 from .models import ChatCompletionRequest, ContentPart
-from .sanitizer import SYSTEM_NOTICE, sanitize_text
+from .pii import SYSTEM_NOTICE, get_anonymizer
 from .session import SessionStore
 
 logger = logging.getLogger("pii_proxy")
@@ -31,21 +31,21 @@ def _resolve_conversation_id(request_headers: dict[str, str], body: ChatCompleti
     cid = request_headers.get("x-conversation-id")
     if cid:
         return cid, False
-    # Check last message for tool_call_id
     if body.messages and body.messages[-1].tool_call_id:
         return body.messages[-1].tool_call_id, False
     return str(uuid.uuid4()), True
 
 
 def _sanitize_message_content(content: str | list[ContentPart] | None, session) -> str | list[ContentPart] | None:
+    anonymizer = get_anonymizer()
     if content is None:
         return None
     if isinstance(content, str):
-        return sanitize_text(content, session)
+        return anonymizer.sanitize(content, session)
     sanitized_parts = []
     for part in content:
         if part.type == "text" and part.text is not None:
-            new_part = part.model_copy(update={"text": sanitize_text(part.text, session)})
+            new_part = part.model_copy(update={"text": anonymizer.sanitize(part.text, session)})
             sanitized_parts.append(new_part)
         else:
             sanitized_parts.append(part)
@@ -58,7 +58,6 @@ def _sanitize_request(body: ChatCompletionRequest, session) -> ChatCompletionReq
         new_content = _sanitize_message_content(msg.content, session)
         sanitized_messages.append(msg.model_copy(update={"content": new_content}))
 
-    # Inject system notice
     if settings.inject_system_notice and not session.system_notice_injected:
         if sanitized_messages and sanitized_messages[0].role == "system":
             first = sanitized_messages[0]
@@ -76,7 +75,6 @@ def _sanitize_request(body: ChatCompletionRequest, session) -> ChatCompletionReq
     return body.model_copy(update={"messages": sanitized_messages})
 
 
-
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     raw_body = await request.json()
@@ -85,8 +83,6 @@ async def chat_completions(request: Request):
     except Exception as e:
         return Response(content=str(e), status_code=422)
 
-    # Remember if client wanted streaming — we force non-streaming upstream
-    # so we can dehash the full response, then re-wrap as SSE if needed.
     client_wants_stream = body.stream
     if client_wants_stream:
         body = body.model_copy(update={"stream": False})
@@ -98,7 +94,7 @@ async def chat_completions(request: Request):
     try:
         sanitized_body = _sanitize_request(body, session)
     except Exception:
-        logger.exception("Presidio sanitization failed")
+        logger.exception("PII sanitization failed")
         return Response(
             content='{"error": "PII sanitization failed"}',
             status_code=500,
@@ -108,45 +104,35 @@ async def chat_completions(request: Request):
     sanitized_dict = sanitized_body.model_dump(exclude_none=True)
     logger.debug("Sanitized request: %s", sanitized_dict)
 
-    # Forward to remote LLM
-    forward_headers = {"Content-Type": "application/json"}
     auth = _get_auth_header(headers_dict)
-    if auth:
-        forward_headers["Authorization"] = auth
+    llm = get_client()
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        try:
-            upstream_resp = await client.post(
-                f"{settings.remote_llm_base_url}/chat/completions",
-                json=sanitized_dict,
-                headers=forward_headers,
-            )
-        except httpx.RequestError as e:
-            logger.error("Upstream request failed: %s", e)
-            return Response(
-                content='{"error": "Failed to reach upstream LLM"}',
-                status_code=502,
-                media_type="application/json",
-            )
-
-    if upstream_resp.status_code != 200:
-        logger.error("Upstream returned %d: %s", upstream_resp.status_code, upstream_resp.text)
+    try:
+        status_code, raw_text = await llm.chat_completion(sanitized_dict, auth)
+    except Exception as e:
+        logger.error("Upstream request failed: %s", e)
         return Response(
-            content=upstream_resp.content,
-            status_code=upstream_resp.status_code,
+            content='{"error": "Failed to reach upstream LLM"}',
+            status_code=502,
             media_type="application/json",
         )
 
-    # Desanitize the entire response text at once to catch all fields
-    raw_text = upstream_resp.text
+    if status_code != 200:
+        logger.error("Upstream returned %d: %s", status_code, raw_text[:500])
+        return Response(
+            content=raw_text,
+            status_code=status_code,
+            media_type="application/json",
+        )
+
     logger.debug("Upstream response: %s", raw_text[:500])
-    desanitized_text = desanitize_text(raw_text, session)
+    anonymizer = get_anonymizer()
+    desanitized_text = anonymizer.desanitize(raw_text, session)
     logger.debug("Desanitized response: %s", desanitized_text[:500])
 
     response_headers = {"X-Conversation-ID": conversation_id}
 
     if client_wants_stream:
-        # Convert chat.completion to chat.completion.chunk format
         resp_data = json.loads(desanitized_text)
         chunk = {
             "id": resp_data.get("id", ""),
@@ -154,11 +140,9 @@ async def chat_completions(request: Request):
             "created": resp_data.get("created", 0),
             "model": resp_data.get("model", ""),
         }
-        # Copy provider-specific fields
         for key in ("provider", "system_fingerprint", "service_tier"):
             if key in resp_data:
                 chunk[key] = resp_data[key]
-        # Convert choices: message -> delta, include all extra fields
         chunk["choices"] = []
         for choice in resp_data.get("choices", []):
             msg = choice.get("message", {})
@@ -167,7 +151,6 @@ async def chat_completions(request: Request):
                 "delta": msg,
                 "finish_reason": choice.get("finish_reason"),
             }
-            # Copy extra choice fields (logprobs, native_finish_reason, etc.)
             for key in choice:
                 if key not in ("index", "message", "finish_reason"):
                     chunk_choice[key] = choice[key]
@@ -198,33 +181,26 @@ async def embeddings(request: Request):
     conversation_id = headers_dict.get("x-conversation-id", str(uuid.uuid4()))
     session = store.get_or_create(conversation_id)
 
-    # Sanitize input text
+    anonymizer = get_anonymizer()
     if "input" in raw_body:
         inp = raw_body["input"]
         if isinstance(inp, str):
-            raw_body["input"] = sanitize_text(inp, session)
+            raw_body["input"] = anonymizer.sanitize(inp, session)
         elif isinstance(inp, list):
             raw_body["input"] = [
-                sanitize_text(item, session) if isinstance(item, str) else item
+                anonymizer.sanitize(item, session) if isinstance(item, str) else item
                 for item in inp
             ]
 
-    forward_headers = {"Content-Type": "application/json"}
     auth = _get_auth_header(headers_dict)
-    if auth:
-        forward_headers["Authorization"] = auth
+    llm = get_client()
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        try:
-            upstream_resp = await client.post(
-                f"{settings.remote_llm_base_url}/embeddings",
-                json=raw_body,
-                headers=forward_headers,
-            )
-        except httpx.RequestError:
-            return Response(content='{"error": "Failed to reach upstream LLM"}', status_code=502, media_type="application/json")
+    try:
+        status_code, content = await llm.embeddings(raw_body, auth)
+    except Exception:
+        return Response(content='{"error": "Failed to reach upstream LLM"}', status_code=502, media_type="application/json")
 
-    return Response(content=upstream_resp.content, status_code=upstream_resp.status_code, media_type="application/json")
+    return Response(content=content, status_code=status_code, media_type="application/json")
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
@@ -236,17 +212,16 @@ async def passthrough(request: Request, path: str):
         forward_headers["Authorization"] = auth
 
     body = await request.body()
-    url = f"{settings.remote_llm_base_url}/{path}"
+    llm = get_client()
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        try:
-            upstream_resp = await client.request(
-                method=request.method,
-                url=url,
-                content=body if body else None,
-                headers=forward_headers,
-            )
-        except httpx.RequestError:
-            return Response(content='{"error": "Failed to reach upstream"}', status_code=502, media_type="application/json")
+    try:
+        status_code, content = await llm.passthrough(
+            method=request.method,
+            path=path,
+            body=body if body else None,
+            headers=forward_headers,
+        )
+    except Exception:
+        return Response(content='{"error": "Failed to reach upstream"}', status_code=502, media_type="application/json")
 
-    return Response(content=upstream_resp.content, status_code=upstream_resp.status_code, media_type="application/json")
+    return Response(content=content, status_code=status_code, media_type="application/json")
