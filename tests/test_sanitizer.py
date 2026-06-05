@@ -10,12 +10,12 @@ def _make_session() -> Session:
 
 def test_person_name_is_replaced():
     session = _make_session()
-    text = "Please contact John Smith about the project."
+    text = "Please contact Tiffany Rogers about the project."
     result = sanitize_text(text, session)
-    assert "John Smith" not in result
+    assert "Tiffany Rogers" not in result
     assert "PERSON" not in result  # no XML tags
     assert len(session.real_to_fake) == 1
-    fake_name = session.real_to_fake["John Smith"]
+    fake_name = session.real_to_fake["Tiffany Rogers"]
     assert fake_name in result
 
 

@@ -22,22 +22,22 @@ def _roundtrip(text: str) -> tuple[str, str, Session]:
 
 def test_paragraph_with_mixed_pii():
     text = (
-        "Dear John Smith, your account (SSN: 123-45-6789) has been flagged. "
+        "Dear Tiffany Rogers, your account (SSN: 123-45-6789) has been flagged. "
         "Please contact us at support@example.com or call 555-123-4567. "
         "Your credit card ending in 4111111111111111 was charged on 2024-03-15. "
         "Regards, Jane Wilson"
     )
     sanitized, restored, session = _roundtrip(text)
-    for real in ["John Smith", "123-45-6789", "support@example.com",
+    for real in ["Tiffany Rogers", "123-45-6789", "support@example.com",
                  "555-123-4567", "4111111111111111", "2024-03-15", "Jane Wilson"]:
         assert real not in sanitized, f"{real} leaked into sanitized text"
         assert real in restored, f"{real} not restored"
 
 
 def test_csv_row():
-    text = 'John Smith,john@example.com,555-123-4567,123-45-6789,1990-01-15'
+    text = 'Tiffany Rogers,john@example.com,555-123-4567,123-45-6789,1990-01-15'
     sanitized, restored, session = _roundtrip(text)
-    assert "John Smith" not in sanitized
+    assert "Tiffany Rogers" not in sanitized
     assert "john@example.com" not in sanitized
     assert "123-45-6789" not in sanitized
     assert restored == text
@@ -67,14 +67,14 @@ def test_multiple_csv_rows():
 
 def test_json_object():
     data = {
-        "user": "John Smith",
+        "user": "Tiffany Rogers",
         "email": "john@example.com",
         "phone": "555-123-4567",
         "ssn": "123-45-6789",
     }
     text = json.dumps(data)
     sanitized, restored, session = _roundtrip(text)
-    assert "John Smith" not in sanitized
+    assert "Tiffany Rogers" not in sanitized
     assert "john@example.com" not in sanitized
     # Sanitized should still be valid JSON-like text
     assert "123-45-6789" not in sanitized
@@ -117,10 +117,10 @@ user_ssn = "987-65-4321"
 
 
 def test_sql_query():
-    text = """SELECT * FROM users WHERE email = 'admin@example.com' AND name = 'John Smith' AND ssn = '123-45-6789';"""
+    text = """SELECT * FROM users WHERE email = 'admin@example.com' AND name = 'Tiffany Rogers' AND ssn = '123-45-6789';"""
     sanitized, restored, session = _roundtrip(text)
     assert "admin@example.com" not in sanitized
-    assert "John Smith" not in sanitized
+    assert "Tiffany Rogers" not in sanitized
     assert "123-45-6789" not in sanitized
     assert "SELECT * FROM users WHERE" in sanitized
     assert restored == text
@@ -145,10 +145,10 @@ def test_javascript_code():
 def test_markdown_table():
     text = """| Name | Email | Phone |
 |------|-------|-------|
-| John Smith | john@example.com | 555-123-4567 |
+| Tiffany Rogers | john@example.com | 555-123-4567 |
 | Jane Wilson | jane.w@example.com | 555-987-6543 |"""
     sanitized, restored, session = _roundtrip(text)
-    assert "John Smith" not in sanitized
+    assert "Tiffany Rogers" not in sanitized
     assert "john@example.com" not in sanitized
     assert "Jane Wilson" not in sanitized
     assert "jane.w@example.com" not in sanitized
@@ -158,11 +158,11 @@ def test_markdown_table():
 # --- Edge cases ---
 
 def test_same_name_different_contexts():
-    text = "John Smith called John Smith's office. John Smith was unavailable."
+    text = "Tiffany Rogers called Tiffany Rogers's office. Tiffany Rogers was unavailable."
     sanitized, restored, session = _roundtrip(text)
-    assert "John Smith" not in sanitized
+    assert "Tiffany Rogers" not in sanitized
     assert len(session.real_to_fake) == 1
-    fake = session.real_to_fake["John Smith"]
+    fake = session.real_to_fake["Tiffany Rogers"]
     assert sanitized.count(fake) == 3
     assert restored == text
 
@@ -225,11 +225,11 @@ def test_international_phone_formats():
 def test_tool_call_json_with_pii():
     """Simulate a tool call arguments string containing PII."""
     args = json.dumps({
-        "query": "Find records for John Smith with email john@example.com",
+        "query": "Find records for Tiffany Rogers with email john@example.com",
         "filters": {"ssn": "123-45-6789", "dob": "1990-05-20"}
     })
     sanitized, restored, session = _roundtrip(args)
-    assert "John Smith" not in sanitized
+    assert "Tiffany Rogers" not in sanitized
     assert "john@example.com" not in sanitized
     assert "123-45-6789" not in sanitized
     assert "1990-05-20" not in sanitized
@@ -239,10 +239,10 @@ def test_tool_call_json_with_pii():
 # --- Name detection edge cases ---
 
 def test_name_after_greeting():
-    """'Hello John Smith' should only redact 'John Smith', not 'Hello'."""
-    text = "Hello John Smith, how are you?"
+    """'Hello Tiffany Rogers' should only redact 'Tiffany Rogers', not 'Hello'."""
+    text = "Hello Tiffany Rogers, how are you?"
     sanitized, restored, session = _roundtrip(text)
-    assert "John Smith" not in sanitized
+    assert "Tiffany Rogers" not in sanitized
     assert sanitized.startswith("Hello ")
     assert restored == text
 
@@ -274,9 +274,9 @@ def test_capitalized_non_names_ignored():
 
 def test_name_with_middle_initial():
     """Names like 'John A Smith' — middle initial breaks word run, only first+last if both known."""
-    text = "Contact John Smith about this."
+    text = "Contact Tiffany Rogers about this."
     sanitized, restored, session = _roundtrip(text)
-    assert "John Smith" not in sanitized
+    assert "Tiffany Rogers" not in sanitized
     assert restored == text
 
 
@@ -289,9 +289,9 @@ def test_three_word_name():
 
 
 def test_name_between_non_names():
-    text = "Yesterday John Smith arrived, and Today Alice Johnson left."
+    text = "Yesterday Tiffany Rogers arrived, and Today Alice Johnson left."
     sanitized, restored, session = _roundtrip(text)
-    assert "John Smith" not in sanitized
+    assert "Tiffany Rogers" not in sanitized
     assert "Alice Johnson" not in sanitized
     assert "Yesterday" in sanitized
     assert restored == text
@@ -322,18 +322,18 @@ def test_stop_words_not_captured():
 
 
 def test_greeting_not_included_in_name():
-    text = "Hello John Smith, welcome."
+    text = "Hello Tiffany Rogers, welcome."
     sanitized, restored, session = _roundtrip(text)
-    assert "John Smith" not in sanitized
+    assert "Tiffany Rogers" not in sanitized
     assert sanitized.startswith("Hello ")
     assert "Hello" not in session.real_to_fake
     assert restored == text
 
 
 def test_sentence_start_non_name_skipped():
-    text = "Regarding John Smith, please advise."
+    text = "Regarding Tiffany Rogers, please advise."
     sanitized, restored, session = _roundtrip(text)
-    assert "John Smith" not in sanitized
+    assert "Tiffany Rogers" not in sanitized
     assert "Regarding" in sanitized
     assert restored == text
 
@@ -348,9 +348,9 @@ def test_code_keywords_not_captured():
 def test_mixed_real_and_fake_names_in_conversation():
     """Simulate multi-turn: first sanitize, then sanitize again with known mappings."""
     session = _make_session()
-    turn1 = sanitize_text("John Smith said hello.", session)
-    assert "John Smith" not in turn1
-    fake_name = session.real_to_fake["John Smith"]
+    turn1 = sanitize_text("Tiffany Rogers said hello.", session)
+    assert "Tiffany Rogers" not in turn1
+    fake_name = session.real_to_fake["Tiffany Rogers"]
 
     # Turn 2: assistant used the fake name, now re-sanitize
     turn2_input = f"Yes, {fake_name} is correct. Also contact Alice Johnson."

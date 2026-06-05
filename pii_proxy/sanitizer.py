@@ -23,6 +23,16 @@ def _load_name_set() -> set[str]:
 
 _KNOWN_NAMES: set[str] = _load_name_set()
 
+
+def _load_notable_people() -> set[str]:
+    notable_file = Path(__file__).parent / "notable_people.txt"
+    if notable_file.exists():
+        return {line.strip() for line in notable_file.read_text().splitlines() if line.strip()}
+    return set()
+
+
+_NOTABLE_PEOPLE: set[str] = _load_notable_people()
+
 _STOP_WORDS: set[str] = {
     "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
     "of", "with", "by", "from", "as", "is", "was", "are", "were", "be",
@@ -205,6 +215,9 @@ def sanitize_text(text: str, session: Session) -> str:
 
     for match in reversed(matches):
         real_value = text[match.start : match.end]
+        # Skip notable people (public figures with Wikipedia pages)
+        if match.entity_type == "PERSON" and real_value in _NOTABLE_PEOPLE:
+            continue
         if real_value in session.real_to_fake:
             fake_value = session.real_to_fake[real_value]
         else:
