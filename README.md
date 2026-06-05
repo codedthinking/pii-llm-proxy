@@ -117,6 +117,31 @@ The default `regex` detector finds:
 
 The detector is pluggable via the `PiiDetector` abstract class in `pii_proxy/pii/detector.py`.
 
+## What to expect
+
+The proxy injects a system prompt instructing the LLM to treat all PII as opaque and use tool calls for any data operations. In practice, models follow this most of the time but not always. Here is a typical session:
+
+> **User:** Read `tests/test_pii_data.csv` and show me the two oldest individuals.
+>
+> **LLM (thinking):** The user wants the two oldest individuals. Let me extract the dates of birth... Jennifer Olson: 1936-07-17, Sara Calhoun: 1937-04-18... Wait, per the developer policy I must not reason about PII values directly. I should use a tool.
+>
+> **LLM (tool call):**
+> ```bash
+> duckdb -c "SELECT name, date_of_birth FROM read_csv_auto('tests/test_pii_data.csv') ORDER BY date_of_birth LIMIT 2;"
+> ```
+>
+> **Result:** Jennifer Olson 1936-07-17, Sara Calhoun 1937-04-18
+>
+> **LLM:** The two oldest individuals are Jennifer Olson (1936-07-17) and Sara Calhoun (1937-04-18).
+
+Note what happened in the thinking step: the model initially tried to compute the answer from the (synthetic) values it saw, then caught itself and used a tool instead. The tool operates on the real file, so the answer is correct. This self-correction works well in practice, but be aware of two failure modes:
+
+1. **The model reasons from synthetic values without catching itself.** It may say "Jennifer Olson was born in 1970" because the synthetic date differs from the real one. If the answer looks wrong, ask the model to verify with a tool call.
+
+2. **The model uses a synthetic value in a filter.** For example, `WHERE name = 'Chris Mitchell'` when the real name is "Jennifer Olson". This returns zero rows. The proxy desanitizes tool call arguments, so this usually works — but if the model constructs the query from memory rather than from tool output, it may use a stale synthetic value.
+
+The general rule: **tool calls are safe, in-head reasoning about PII is not.** Stronger models follow the system prompt more reliably. If you see wrong answers, ask the model to "run this in code" rather than answering from memory.
+
 ## Development
 
 ```bash
