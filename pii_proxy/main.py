@@ -105,6 +105,10 @@ async def _stream_with_desanitization(body: dict, session, headers: dict[str, st
     content_buf = ""
     content_emitted = 0
 
+    # Reasoning buffer (for thinking/chain-of-thought output)
+    reasoning_buf = ""
+    reasoning_emitted = 0
+
     # Tool-call argument buffers: keyed by (choice_index, tool_call_index)
     tc_bufs: dict[tuple[int, int], str] = {}
     tc_emitted: dict[tuple[int, int], int] = {}
@@ -151,6 +155,12 @@ async def _stream_with_desanitization(body: dict, session, headers: dict[str, st
                         if delta:
                             flush_chunk = {"choices": [{"index": 0, "delta": {"content": delta}}]}
                             yield f"data: {json.dumps(flush_chunk, ensure_ascii=False)}\n\n"
+                    # Flush reasoning buffer
+                    if reasoning_buf:
+                        delta, _ = _settled_desanitize(reasoning_buf, reasoning_emitted, flush=True)
+                        if delta:
+                            flush_chunk = {"choices": [{"index": 0, "delta": {"reasoning_content": delta}}]}
+                            yield f"data: {json.dumps(flush_chunk, ensure_ascii=False)}\n\n"
                     # Flush tool-call argument buffers
                     for (ci, ti), buf in tc_bufs.items():
                         delta, _ = _settled_desanitize(buf, tc_emitted.get((ci, ti), 0), flush=True)
@@ -187,8 +197,37 @@ async def _stream_with_desanitization(body: dict, session, headers: dict[str, st
                         if emit_delta:
                             choice["delta"]["content"] = emit_delta
                         else:
-                            # Hold back — remove content from this chunk
                             del choice["delta"]["content"]
+
+                    # --- Reasoning / thinking ---
+                    # Providers use "reasoning_content" or "reasoning"
+                    for rkey in ("reasoning_content", "reasoning"):
+                        rval = delta.get(rkey)
+                        if rval is not None:
+                            # Some providers nest as {"content": "..."}
+                            if isinstance(rval, dict):
+                                rtext = rval.get("content")
+                                if rtext is not None:
+                                    has_text = True
+                                    reasoning_buf += rtext
+                                    emit_delta, reasoning_emitted = _settled_desanitize(
+                                        reasoning_buf, reasoning_emitted, flush=is_finished,
+                                    )
+                                    if emit_delta:
+                                        rval["content"] = emit_delta
+                                    else:
+                                        rval["content"] = ""
+                            elif isinstance(rval, str):
+                                has_text = True
+                                reasoning_buf += rval
+                                emit_delta, reasoning_emitted = _settled_desanitize(
+                                    reasoning_buf, reasoning_emitted, flush=is_finished,
+                                )
+                                if emit_delta:
+                                    choice["delta"][rkey] = emit_delta
+                                else:
+                                    del choice["delta"][rkey]
+                            break  # only one reasoning field per delta
 
                     # --- Tool-call arguments ---
                     tool_calls = delta.get("tool_calls")
