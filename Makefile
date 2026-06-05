@@ -1,8 +1,7 @@
 .PHONY: install test run
 
 install:
-	uv pip install -r requirements.txt
-	python -m spacy download en_core_web_lg
+	uv sync
 
 test:
 	uv run pytest tests/ -v
