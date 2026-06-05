@@ -34,7 +34,7 @@ def test_single_turn_sanitize_and_dehash():
             json={
                 "model": "test-model",
                 "messages": [
-                    {"role": "user", "content": "My name is John Doe and my email is john@example.com."}
+                    {"role": "user", "content": "My name is Tiffany Rogers and my email is john@example.com."}
                 ],
             },
         )
@@ -45,7 +45,7 @@ def test_single_turn_sanitize_and_dehash():
         sent_body = json.loads(route.calls[0].request.content)
         for msg in sent_body["messages"]:
             if isinstance(msg.get("content"), str):
-                assert "John Doe" not in msg["content"]
+                assert "Tiffany Rogers" not in msg["content"]
                 assert "john@example.com" not in msg["content"]
 
 
