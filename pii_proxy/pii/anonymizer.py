@@ -5,12 +5,8 @@ from faker import Faker
 from ..session import Session
 from .detector import PiiDetector
 
-SYSTEM_NOTICE = (
-    "All PII in this conversation has been replaced with realistic fake values. "
-    "Names, emails, phone numbers, and IDs you see are synthetic — do not treat "
-    "them as real. If you use them in tool calls, expect mismatches. "
-    "The user sees the real values automatically."
-)
+_NOTICE_FILE = Path(__file__).parent / "system_notice.md"
+SYSTEM_NOTICE = _NOTICE_FILE.read_text().strip() if _NOTICE_FILE.exists() else ""
 
 _FAKER_GENERATORS: dict[str, str] = {
     "PERSON": "name",
