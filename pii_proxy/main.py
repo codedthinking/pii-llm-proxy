@@ -2,11 +2,11 @@ import json
 import logging
 import uuid
 
+import httpx
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse
 
 from .config import settings
-from .llm import get_client
-from .models import ChatCompletionRequest, ContentPart
 from .pii import SYSTEM_NOTICE, get_anonymizer
 from .session import SessionStore
 
@@ -16,83 +16,199 @@ logging.basicConfig(level=logging.DEBUG)
 app = FastAPI(title="PII Sanitizing LLM Proxy")
 store = SessionStore()
 
-
-def _get_auth_header(headers_dict: dict[str, str]) -> str | None:
-    """Return auth header from client request, falling back to configured API key."""
-    if "authorization" in headers_dict:
-        return headers_dict["authorization"]
-    if settings.openrouter_api_key:
-        return f"Bearer {settings.openrouter_api_key}"
-    return None
+# Headers that must not be forwarded between client and upstream.
+_HOP_BY_HOP = frozenset({
+    "host", "connection", "keep-alive", "transfer-encoding",
+    "te", "trailer", "upgrade", "content-length",
+})
 
 
-def _resolve_conversation_id(request_headers: dict[str, str], body: ChatCompletionRequest) -> tuple[str, bool]:
-    """Return (conversation_id, is_new)."""
-    cid = request_headers.get("x-conversation-id")
-    if cid:
-        return cid, False
-    if body.messages and body.messages[-1].tool_call_id:
-        return body.messages[-1].tool_call_id, False
-    return str(uuid.uuid4()), True
+def _forward_headers(raw_headers: list[tuple[bytes, bytes]]) -> dict[str, str]:
+    """Build upstream headers by forwarding everything except hop-by-hop."""
+    out: dict[str, str] = {}
+    for name_b, value_b in raw_headers:
+        name = name_b.decode("latin-1").lower()
+        if name in _HOP_BY_HOP:
+            continue
+        out[name] = value_b.decode("latin-1")
+    return out
 
 
-def _sanitize_message_content(content: str | list[ContentPart] | None, session) -> str | list[ContentPart] | None:
+def _resolve_conversation_id(headers: dict[str, str]) -> str:
+    return headers.get("x-conversation-id", str(uuid.uuid4()))
+
+
+def _sanitize_messages_in_place(body: dict, session) -> None:
+    """Walk messages and sanitize text content in place."""
     anonymizer = get_anonymizer()
-    if content is None:
-        return None
-    if isinstance(content, str):
-        return anonymizer.sanitize(content, session)
-    sanitized_parts = []
-    for part in content:
-        if part.type == "text" and part.text is not None:
-            new_part = part.model_copy(update={"text": anonymizer.sanitize(part.text, session)})
-            sanitized_parts.append(new_part)
+    messages = body.get("messages")
+    if not messages:
+        return
+    for msg in messages:
+        content = msg.get("content")
+        if content is None:
+            continue
+        if isinstance(content, str):
+            msg["content"] = anonymizer.sanitize(content, session)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                    part["text"] = anonymizer.sanitize(part["text"], session)
+
+
+def _inject_system_notice(body: dict, session) -> None:
+    """Prepend system notice about synthetic PII if not already injected."""
+    if not settings.inject_system_notice or session.system_notice_injected:
+        return
+    messages = body.get("messages", [])
+    if messages and messages[0].get("role") == "system":
+        first = messages[0]
+        if isinstance(first.get("content"), str):
+            first["content"] = SYSTEM_NOTICE + "\n\n" + first["content"]
         else:
-            sanitized_parts.append(part)
-    return sanitized_parts
+            first["content"] = SYSTEM_NOTICE
+    else:
+        messages.insert(0, {"role": "system", "content": SYSTEM_NOTICE})
+    session.system_notice_injected = True
 
 
-def _sanitize_request(body: ChatCompletionRequest, session) -> ChatCompletionRequest:
-    sanitized_messages = []
-    for msg in body.messages:
-        new_content = _sanitize_message_content(msg.content, session)
-        sanitized_messages.append(msg.model_copy(update={"content": new_content}))
+async def _forward_non_streaming(
+    body: dict, headers: dict[str, str], path: str,
+) -> Response:
+    """Forward request and return the complete response."""
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(
+            f"{settings.upstream_base_url}/{path}",
+            content=json.dumps(body, ensure_ascii=False).encode(),
+            headers=headers,
+        )
+    return resp.status_code, resp.text, resp.headers
 
-    if settings.inject_system_notice and not session.system_notice_injected:
-        if sanitized_messages and sanitized_messages[0].role == "system":
-            first = sanitized_messages[0]
-            if isinstance(first.content, str):
-                new_content = SYSTEM_NOTICE + "\n\n" + first.content
-            else:
-                new_content = SYSTEM_NOTICE
-            sanitized_messages[0] = first.model_copy(update={"content": new_content})
-        else:
-            from .models import Message
-            notice_msg = Message(role="system", content=SYSTEM_NOTICE)
-            sanitized_messages.insert(0, notice_msg)
-        session.system_notice_injected = True
 
-    return body.model_copy(update={"messages": sanitized_messages})
+async def _stream_with_desanitization(body: dict, session, headers: dict[str, str]):
+    """Stream SSE chunks from upstream, desanitizing text content on the fly.
+
+    Uses a buffer to handle fake values that may span chunk boundaries.
+    Only emits text that is "settled" — i.e., cannot be part of a partial
+    fake value match. Flushes the remainder on stream end.
+    """
+    anonymizer = get_anonymizer()
+
+    # Accumulated raw content text from all chunks so far
+    raw_buffer = ""
+    # How many characters of desanitized output we have already emitted
+    emitted_len = 0
+
+    def _max_fake_len() -> int:
+        if not session.fake_to_real:
+            return 0
+        return max(len(f) for f in session.fake_to_real)
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        async with client.stream(
+            "POST",
+            f"{settings.upstream_base_url}/chat/completions",
+            content=json.dumps(body, ensure_ascii=False).encode(),
+            headers=headers,
+        ) as resp:
+            if resp.status_code != 200:
+                # Non-200: read full body and yield as-is
+                body_bytes = await resp.aread()
+                yield body_bytes
+                return
+
+            async for raw_line in resp.aiter_lines():
+                if not raw_line.startswith("data: "):
+                    # Forward non-data lines (empty lines, comments) as-is
+                    yield raw_line + "\n"
+                    continue
+
+                payload = raw_line[6:]
+
+                if payload.strip() == "[DONE]":
+                    # Flush remaining buffer
+                    if raw_buffer:
+                        desanitized_full = anonymizer.desanitize(raw_buffer, session)
+                        remaining = desanitized_full[emitted_len:]
+                        if remaining:
+                            # We need to emit a final content chunk with the remaining text.
+                            # Reconstruct using the last seen chunk as template.
+                            flush_chunk = {
+                                "choices": [{"index": 0, "delta": {"content": remaining}}],
+                            }
+                            yield f"data: {json.dumps(flush_chunk, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                try:
+                    chunk = json.loads(payload)
+                except json.JSONDecodeError:
+                    yield raw_line + "\n"
+                    continue
+
+                # Extract content delta
+                choices = chunk.get("choices", [])
+                has_content = False
+                is_finished = False
+                for choice in choices:
+                    delta = choice.get("delta", {})
+                    content = delta.get("content")
+                    if choice.get("finish_reason"):
+                        is_finished = True
+                    if content is not None:
+                        has_content = True
+                        raw_buffer += content
+
+                if not has_content:
+                    # Non-content chunk (role, tool_calls, etc.) — forward as-is
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    continue
+
+                # Determine how much we can safely emit
+                mfl = _max_fake_len()
+                desanitized_full = anonymizer.desanitize(raw_buffer, session)
+
+                if is_finished or mfl == 0:
+                    safe_end = len(desanitized_full)
+                else:
+                    safe_end = max(0, len(desanitized_full) - mfl)
+
+                delta_text = desanitized_full[emitted_len:safe_end]
+                emitted_len = safe_end
+
+                if delta_text:
+                    # Replace content in the chunk with desanitized delta
+                    for choice in chunk.get("choices", []):
+                        if "delta" in choice and "content" in choice["delta"]:
+                            choice["delta"]["content"] = delta_text
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                elif is_finished:
+                    # Flush any remaining
+                    remaining = desanitized_full[emitted_len:]
+                    if remaining:
+                        for choice in chunk.get("choices", []):
+                            if "delta" in choice:
+                                choice["delta"]["content"] = remaining
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                # If delta_text is empty and not finished, hold back (buffering)
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    raw_body = await request.json()
     try:
-        body = ChatCompletionRequest.model_validate(raw_body)
-    except Exception as e:
-        return Response(content=str(e), status_code=422)
+        raw_body = await request.json()
+    except Exception:
+        return Response(content='{"error": "Invalid JSON"}', status_code=400, media_type="application/json")
 
-    client_wants_stream = body.stream
-    if client_wants_stream:
-        body = body.model_copy(update={"stream": False})
-
-    headers_dict = {k.lower(): v for k, v in request.headers.items()}
-    conversation_id, is_new = _resolve_conversation_id(headers_dict, body)
+    fwd_headers = _forward_headers(request.headers.raw)
+    conversation_id = _resolve_conversation_id(
+        {k.lower(): v for k, v in request.headers.items()}
+    )
     session = store.get_or_create(conversation_id)
 
     try:
-        sanitized_body = _sanitize_request(body, session)
+        _sanitize_messages_in_place(raw_body, session)
+        _inject_system_notice(raw_body, session)
     except Exception:
         logger.exception("PII sanitization failed")
         return Response(
@@ -101,15 +217,24 @@ async def chat_completions(request: Request):
             media_type="application/json",
         )
 
-    sanitized_dict = sanitized_body.model_dump(exclude_none=True)
-    logger.debug("Sanitized request: %s", sanitized_dict)
+    logger.debug("Sanitized request: %s", json.dumps(raw_body, ensure_ascii=False)[:500])
+    response_headers = {"X-Conversation-ID": conversation_id}
 
-    auth = _get_auth_header(headers_dict)
-    llm = get_client()
+    is_streaming = raw_body.get("stream", False)
 
+    if is_streaming:
+        return StreamingResponse(
+            _stream_with_desanitization(raw_body, session, fwd_headers),
+            media_type="text/event-stream",
+            headers=response_headers,
+        )
+
+    # Non-streaming: forward, desanitize full response, return
     try:
-        status_code, raw_text = await llm.chat_completion(sanitized_dict, auth)
-    except Exception as e:
+        status_code, raw_text, upstream_headers = await _forward_non_streaming(
+            raw_body, fwd_headers, "chat/completions",
+        )
+    except httpx.RequestError as e:
         logger.error("Upstream request failed: %s", e)
         return Response(
             content='{"error": "Failed to reach upstream LLM"}',
@@ -118,110 +243,42 @@ async def chat_completions(request: Request):
         )
 
     if status_code != 200:
-        logger.error("Upstream returned %d: %s", status_code, raw_text[:500])
-        return Response(
-            content=raw_text,
-            status_code=status_code,
-            media_type="application/json",
-        )
+        return Response(content=raw_text, status_code=status_code, media_type="application/json")
 
-    logger.debug("Upstream response: %s", raw_text[:500])
     anonymizer = get_anonymizer()
-    desanitized_text = anonymizer.desanitize(raw_text, session)
-    logger.debug("Desanitized response: %s", desanitized_text[:500])
-
-    response_headers = {"X-Conversation-ID": conversation_id}
-
-    if client_wants_stream:
-        resp_data = json.loads(desanitized_text)
-        chunk = {
-            "id": resp_data.get("id", ""),
-            "object": "chat.completion.chunk",
-            "created": resp_data.get("created", 0),
-            "model": resp_data.get("model", ""),
-        }
-        for key in ("provider", "system_fingerprint", "service_tier"):
-            if key in resp_data:
-                chunk[key] = resp_data[key]
-        chunk["choices"] = []
-        for choice in resp_data.get("choices", []):
-            msg = choice.get("message", {})
-            chunk_choice = {
-                "index": choice.get("index", 0),
-                "delta": msg,
-                "finish_reason": choice.get("finish_reason"),
-            }
-            for key in choice:
-                if key not in ("index", "message", "finish_reason"):
-                    chunk_choice[key] = choice[key]
-            chunk["choices"].append(chunk_choice)
-        if "usage" in resp_data:
-            chunk["usage"] = resp_data["usage"]
-        chunk_json = json.dumps(chunk, ensure_ascii=False)
-        sse_body = f"data: {chunk_json}\n\ndata: [DONE]\n\n"
-        return Response(
-            content=sse_body,
-            status_code=200,
-            media_type="text/event-stream",
-            headers=response_headers,
-        )
-
+    desanitized = anonymizer.desanitize(raw_text, session)
     return Response(
-        content=desanitized_text,
+        content=desanitized,
         status_code=200,
         media_type="application/json",
         headers=response_headers,
     )
 
 
-@app.post("/v1/embeddings")
-async def embeddings(request: Request):
-    raw_body = await request.json()
-    headers_dict = {k.lower(): v for k, v in request.headers.items()}
-    conversation_id = headers_dict.get("x-conversation-id", str(uuid.uuid4()))
-    session = store.get_or_create(conversation_id)
-
-    anonymizer = get_anonymizer()
-    if "input" in raw_body:
-        inp = raw_body["input"]
-        if isinstance(inp, str):
-            raw_body["input"] = anonymizer.sanitize(inp, session)
-        elif isinstance(inp, list):
-            raw_body["input"] = [
-                anonymizer.sanitize(item, session) if isinstance(item, str) else item
-                for item in inp
-            ]
-
-    auth = _get_auth_header(headers_dict)
-    llm = get_client()
-
-    try:
-        status_code, content = await llm.embeddings(raw_body, auth)
-    except Exception:
-        return Response(content='{"error": "Failed to reach upstream LLM"}', status_code=502, media_type="application/json")
-
-    return Response(content=content, status_code=status_code, media_type="application/json")
-
-
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def passthrough(request: Request, path: str):
-    headers_dict = {k.lower(): v for k, v in request.headers.items()}
-    forward_headers = {"Content-Type": headers_dict.get("content-type", "application/json")}
-    auth = _get_auth_header(headers_dict)
-    if auth:
-        forward_headers["Authorization"] = auth
-
+    """Pure byte-level passthrough — no PII processing."""
+    fwd_headers = _forward_headers(request.headers.raw)
     body = await request.body()
-    llm = get_client()
+    url = f"{settings.upstream_base_url}/{path}"
 
-    try:
-        status_code, content = await llm.passthrough(
-            method=request.method,
-            path=path,
-            body=body if body else None,
-            headers=forward_headers,
-        )
-    except Exception:
-        return Response(content='{"error": "Failed to reach upstream"}', status_code=502, media_type="application/json")
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        try:
+            resp = await client.request(
+                method=request.method,
+                url=url,
+                content=body if body else None,
+                headers=fwd_headers,
+            )
+        except httpx.RequestError:
+            return Response(
+                content='{"error": "Failed to reach upstream"}',
+                status_code=502,
+                media_type="application/json",
+            )
 
-    return Response(content=content, status_code=status_code, media_type="application/json")
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+    )
