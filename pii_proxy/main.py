@@ -24,13 +24,19 @@ _HOP_BY_HOP = frozenset({
 
 
 def _forward_headers(raw_headers: list[tuple[bytes, bytes]]) -> dict[str, str]:
-    """Build upstream headers by forwarding everything except hop-by-hop."""
+    """Build upstream headers by forwarding everything except hop-by-hop.
+
+    If the client doesn't send an Authorization header, injects the
+    configured upstream_api_key as a Bearer token (if set).
+    """
     out: dict[str, str] = {}
     for name_b, value_b in raw_headers:
         name = name_b.decode("latin-1").lower()
         if name in _HOP_BY_HOP:
             continue
         out[name] = value_b.decode("latin-1")
+    if "authorization" not in out and settings.upstream_api_key:
+        out["authorization"] = f"Bearer {settings.upstream_api_key}"
     return out
 
 
